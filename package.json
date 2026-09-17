@@ -1,0 +1,57 @@
+{
+  "name": "wallet-studio",
+  "version": "1.0.0",
+  "description": "Multi-wallet transaction orchestration for Base mainnet and Base Sepolia",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "bundler": "./dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli/index.ts",
+    "start": "node dist/cli/index.js",
+    "typecheck": "tsc --noEmit && tsc -p ui/tsconfig.json",
+    "build:ui": "tsc -p ui/tsconfig.json && node scripts/build-ui.mjs",
+    "studio": "npm run build && npm run build:ui && node dist/studio/start.js",
+    "wallet:create": "tsx src/cli/index.ts wallet create",
+    "bundle:list": "tsx src/cli/index.ts bundle list",
+    "test": "npm run build && node --test dist/security.test.js dist/utils/concurrency.test.js dist/chain/networks.test.js dist/studio/studio.test.js dist/curve/curve.test.js dist/sepolia/profiles.test.js dist/sepolia/deployment-errors.test.js",
+    "local:curve:up": "npm run build && npm run build:ui && node scripts/curve-stack.mjs",
+    "local:curve:test": "npm run build && node scripts/curve-stack.mjs --test",
+    "local:curve:down": "powershell -NoProfile -File scripts/curve-down.ps1",
+    "sepolia:curve:up": "npm run build && npm run build:ui && node scripts/sepolia-stack.mjs",
+    "sepolia:curve:down": "powershell -NoProfile -File scripts/sepolia-down.ps1",
+    "sepolia:curve:rehearse": "npm run build && node scripts/sepolia-rehearsal.mjs"
+  },
+  "keywords": [
+    "base",
+    "evm",
+    "bundler",
+    "viem"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "2.1.10",
+    "commander": "13.1.0",
+    "dotenv": "16.6.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "viem": "2.55.19",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "4.3.3",
+    "@types/node": "22.20.1",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "esbuild": "0.28.2",
+    "tailwindcss": "4.3.3",
+    "tsx": "4.23.12",
+    "typescript": "5.9.3"
+  },
+  "private": true
+}
