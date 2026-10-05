@@ -91,6 +91,7 @@ export class BundleBuilder {
       status: "CREATED",
     };
     bundle.actions.push(action);
+    bundle.dryRun = undefined;
     if (!bundle.wallets.some((w) => w.toLowerCase() === input.walletAddress.toLowerCase())) {
       bundle.wallets.push(input.walletAddress);
     }
@@ -233,8 +234,7 @@ export class BundleBuilder {
       if (
         action.status === "CREATED" ||
         action.status === "VALIDATED" ||
-        action.status === "SIMULATED" ||
-        action.status === "SIGNED"
+        action.status === "SIMULATED"
       ) {
         action.status = "CANCELLED";
       }
@@ -255,6 +255,7 @@ export class BundleBuilder {
       createdAt: nowIso(),
       updatedAt: nowIso(),
       mode: this.config.mode,
+      dryRun: undefined,
       actions: source.actions.map((a) => ({
         ...a,
         id: randomUUID(),
@@ -262,6 +263,7 @@ export class BundleBuilder {
         txHash: undefined,
         nonce: undefined,
         gasUsed: undefined,
+        effectiveGasPrice: undefined,
         error: undefined,
         blockNumber: undefined,
         submittedAt: undefined,
@@ -303,6 +305,7 @@ export class BundleBuilder {
     let failed = 0;
     let pending = 0;
     let gasSpent = 0n;
+    let gasCostKnown = true;
     for (const action of bundle.actions) {
       if (action.status === "CONFIRMED") successful += 1;
       else if (
@@ -317,7 +320,10 @@ export class BundleBuilder {
       } else if (action.status !== "CANCELLED") {
         pending += 1;
       }
-      if (action.gasUsed) gasSpent += BigInt(action.gasUsed);
+      if (action.gasUsed) {
+        if (action.effectiveGasPrice === undefined) gasCostKnown = false;
+        else gasSpent += BigInt(action.gasUsed) * BigInt(action.effectiveGasPrice);
+      }
     }
     return {
       id: bundle.id,
@@ -326,7 +332,7 @@ export class BundleBuilder {
       successful,
       failed,
       pending,
-      gasSpentWei: gasSpent.toString(),
+      gasSpentWei: gasCostKnown ? gasSpent.toString() : null,
       status: bundle.status,
     };
   }

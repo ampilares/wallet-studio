@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { withFileLock } from "../utils/fileLock.js";
-import { assertBundleChain, hasSubmissionEvidence, isMockAction } from "./transactionSafety.js";
+import { assertBundleChain, assertFreshDryRun, assertGarlicSpendCeilings, assertNoUnresolvedBundles, hasSubmissionEvidence, isMockAction } from "./transactionSafety.js";
+import { assertNoPendingDirectTransactions } from "./DirectTransactionSender.js";
 import { keccak256, type Hex } from "viem";
 import type { AppConfig } from "../config.js";
 import type { RpcManager } from "../chain/RpcManager.js";
@@ -17,6 +18,7 @@ import type { NonceManager } from "../wallet/NonceManager.js";
 import type { Bundle, BundleAction, RecordedTransaction, TxLifecycleStatus } from "../types.js";
 import type { Simulator } from "../simulation/Simulator.js";
 import { mapPool } from "../utils/concurrency.js";
+import { safeRpcError } from "../security/errors.js";
 
 function classifyError(err: unknown): TxLifecycleStatus {
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
@@ -59,17 +61,33 @@ export class ExecutionEngine {
       throw new Error("No actions");
     }
 
+    assertGarlicSpendCeilings(bundle);
+    if (this.config.network === "mainnet") {
+      const chainId = await this.rpc.getPublicClient().getChainId();
+      if (chainId !== 8453) throw new Error(`Base mainnet RPC chain mismatch: expected 8453, received ${chainId}`);
+      if (this.config.mode === "live" && bundle.mode === "live") {
+        if (!this.config.mainnetSendEnabled) throw new Error("Mainnet send is disabled; set MAINNET_SEND_ENABLED=true only for an approved broadcast session");
+        assertFreshDryRun(bundle);
+      }
+    }
+
     if (this.config.mode === "live" && bundle.mode === "live" && bundle.actions.some(isMockAction)) {
       throw new Error("Mock DEX actions are forbidden in live mode");
     }
     await this.reconcileActions(bundle);
     // An ambiguous prior submission blocks further sends until its receipt is known.
     if (bundle.actions.some((a) => hasSubmissionEvidence(a) &&
-      !["CONFIRMED", "REVERTED", "CANCELLED"].includes(a.status))) {
+      !["CONFIRMED", "REVERTED"].includes(a.status))) {
       await this.bundles.save(bundle);
       return this.finalize(bundleId);
     }
     this.metrics.reset();
+
+    if (this.config.mode === "live" && bundle.mode === "live") {
+      const wallets = bundle.actions.map(action => action.walletAddress);
+      await assertNoUnresolvedBundles(this.bundles, bundle.chainId!, wallets, bundle.id);
+      await assertNoPendingDirectTransactions(this.config, bundle.chainId!, wallets);
+    }
 
     const report = await this.simulator.simulateBundle(bundle);
     if (!report.ok) {
@@ -217,8 +235,12 @@ export class ExecutionEngine {
         hash,
         timeout: 120_000,
       });
+      if (receipt.transactionHash !== hash) throw new Error("Receipt identity differs from the signed transaction");
       const confirmLatencyMs = Date.now() - confirmStarted;
       action.confirmLatencyMs = confirmLatencyMs;
+      action.gasUsed = receipt.gasUsed.toString();
+      action.effectiveGasPrice = receipt.effectiveGasPrice?.toString();
+      action.blockNumber = receipt.blockNumber.toString();
 
       if (receipt.status === "reverted") {
         action.status = "REVERTED";
@@ -234,8 +256,6 @@ export class ExecutionEngine {
       } else {
         action.status = "CONFIRMED";
         action.confirmedAt = new Date().toISOString();
-        action.blockNumber = receipt.blockNumber.toString();
-        action.gasUsed = receipt.gasUsed.toString();
         this.metrics.record({
           actionId: action.id,
           wallet: action.walletAddress,
@@ -258,7 +278,7 @@ export class ExecutionEngine {
       } else {
         action.status = action.txHash ? "SUBMITTED" : "SIGNED";
       }
-      action.error = err instanceof Error ? err.message : String(err);
+      action.error = safeRpcError(err);
       action.submitLatencyMs = Date.now() - submitStarted;
       this.metrics.record({
         actionId: action.id,
@@ -291,11 +311,13 @@ export class ExecutionEngine {
 
   private async reconcileActions(bundle: Bundle): Promise<void> {
     for (const action of bundle.actions) {
-      if (!action.txHash || action.status === "CONFIRMED" || action.status === "CANCELLED") continue;
+      if (!action.txHash || action.status === "CONFIRMED") continue;
       try {
         const receipt = await this.rpc.getPublicClient().getTransactionReceipt({ hash: action.txHash });
+        if (receipt.transactionHash !== action.txHash) throw new Error("Receipt identity mismatch");
         action.status = receipt.status === "reverted" ? "REVERTED" : "CONFIRMED";
         action.gasUsed = receipt.gasUsed.toString();
+        action.effectiveGasPrice = receipt.effectiveGasPrice?.toString();
         action.blockNumber = receipt.blockNumber.toString();
         action.confirmedAt = new Date().toISOString();
         action.error = receipt.status === "reverted" ? "Transaction reverted" : undefined;

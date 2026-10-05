@@ -9,6 +9,9 @@ import { StudioService } from "../dist/studio/service.js";
 import { CurveService } from "../dist/curve/service.js";
 import { runCurveChecks } from "../dist/curve/checks.js";
 import { createStudioServer } from "../dist/studio/server.js";
+import { hardenSensitiveFiles } from "./harden-sensitive-files.mjs";
+
+hardenSensitiveFiles(root, process.env.DATA_DIR || "data/base-mainnet");
 
 const testing = process.argv.includes("--test");
 const rpcPort = testing ? 18547 : 8546;

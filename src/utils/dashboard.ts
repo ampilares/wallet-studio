@@ -21,7 +21,7 @@ export function renderBundleDashboard(
     `│ Failed        ${String(summary.failed).padStart(24)} │`,
     `│ Pending       ${String(summary.pending).padStart(24)} │`,
     "│                                          │",
-    `│ Gas spent     ${formatEther(BigInt(summary.gasSpentWei || "0")).padStart(24)} │`,
+    `│ L2 fee ETH    ${(summary.gasSpentWei === null ? "not recorded" : formatEther(BigInt(summary.gasSpentWei))).padStart(24)} │`,
   ];
 
   if (extras?.estimatedGasEth) {

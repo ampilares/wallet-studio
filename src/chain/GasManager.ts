@@ -4,6 +4,7 @@ import type { AppConfig } from "../config.js";
 import type { RpcManager } from "./RpcManager.js";
 import type { Bundle, GasPlan } from "../types.js";
 import type { WalletManager } from "../wallet/WalletManager.js";
+import { safeCliError } from "../security/errors.js";
 
 export class GasManager {
   constructor(
@@ -108,7 +109,7 @@ export class GasManager {
         results.push({
           to,
           ok: false,
-          error: err instanceof Error ? err.message : String(err),
+          error: safeCliError(err),
         });
       }
     }

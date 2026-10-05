@@ -1,5 +1,5 @@
 import {
-  encodeDeployData,
+  encodeAbiParameters,
   encodeFunctionData,
   type Address,
   type Hex,
@@ -8,7 +8,8 @@ import type { RpcManager } from "../chain/RpcManager.js";
 import type { WalletManager } from "../wallet/WalletManager.js";
 import type { NonceManager } from "../wallet/NonceManager.js";
 import type { AppConfig } from "../config.js";
-import { simpleErc20Artifact } from "./SimpleERC20.js";
+import { simpleErc20Abi } from "./SimpleERC20.js";
+import { sendDirectTransaction } from "../core/DirectTransactionSender.js";
 
 export class TokenManager {
   constructor(
@@ -24,25 +25,16 @@ export class TokenManager {
     symbol: string;
     decimals?: number;
     initialSupply: bigint;
-  }): Promise<{ address?: Address; hash?: Hex; simulated: boolean; bytecode: Hex }> {
+  }): Promise<{ simulated: true; deploymentSupported: false; constructorData: Hex }> {
     if (this.config.mode === "live") {
-      throw new Error("Live token deployment is disabled: the bundled bytecode is a placeholder");
+      throw new Error("Live token deployment is disabled: no reviewed compiled artifact is available");
     }
-    const bytecode = encodeDeployData({
-      abi: simpleErc20Artifact.abi,
-      bytecode: simpleErc20Artifact.bytecode,
-      args: [args.name, args.symbol, args.decimals ?? 18, args.initialSupply, args.from],
-    });
-
-    if (this.config.mode === "simulation") {
-      // Placeholder bytecode is not executable on-chain; validate inputs only.
-      if (!args.name || !args.symbol || args.initialSupply < 0n) {
-        throw new Error("Invalid token deploy parameters");
-      }
-      return { simulated: true, bytecode };
+    if (!args.name || !args.symbol || args.initialSupply < 0n) {
+      throw new Error("Invalid token deploy parameters");
     }
-
-    throw new Error("Unsupported deployment mode");
+    const constructorData = encodeAbiParameters(simpleErc20Abi[0].inputs,
+      [args.name, args.symbol, args.decimals ?? 18, args.initialSupply, args.from]);
+    return { simulated: true, deploymentSupported: false, constructorData };
   }
 
   async getTokenMetadata(token: Address): Promise<{
@@ -55,22 +47,22 @@ export class TokenManager {
     const [name, symbol, decimals, totalSupply] = await Promise.all([
       client.readContract({
         address: token,
-        abi: simpleErc20Artifact.abi,
+        abi: simpleErc20Abi,
         functionName: "name",
       }),
       client.readContract({
         address: token,
-        abi: simpleErc20Artifact.abi,
+        abi: simpleErc20Abi,
         functionName: "symbol",
       }),
       client.readContract({
         address: token,
-        abi: simpleErc20Artifact.abi,
+        abi: simpleErc20Abi,
         functionName: "decimals",
       }),
       client.readContract({
         address: token,
-        abi: simpleErc20Artifact.abi,
+        abi: simpleErc20Abi,
         functionName: "totalSupply",
       }),
     ]);
@@ -79,7 +71,7 @@ export class TokenManager {
 
   buildTransferCalldata(to: Address, amount: bigint): Hex {
     return encodeFunctionData({
-      abi: simpleErc20Artifact.abi,
+      abi: simpleErc20Abi,
       functionName: "transfer",
       args: [to, amount],
     });
@@ -87,7 +79,7 @@ export class TokenManager {
 
   buildApproveCalldata(spender: Address, amount: bigint): Hex {
     return encodeFunctionData({
-      abi: simpleErc20Artifact.abi,
+      abi: simpleErc20Abi,
       functionName: "approve",
       args: [spender, amount],
     });
@@ -103,7 +95,7 @@ export class TokenManager {
 
   async mint(from: Address, token: Address, to: Address, amount: bigint) {
     const data = encodeFunctionData({
-      abi: simpleErc20Artifact.abi,
+      abi: simpleErc20Abi,
       functionName: "mint",
       args: [to, amount],
     });
@@ -112,7 +104,7 @@ export class TokenManager {
 
   async burn(from: Address, token: Address, amount: bigint) {
     const data = encodeFunctionData({
-      abi: simpleErc20Artifact.abi,
+      abi: simpleErc20Abi,
       functionName: "burn",
       args: [amount],
     });
@@ -120,30 +112,6 @@ export class TokenManager {
   }
 
   private async sendTokenTx(from: Address, token: Address, data: Hex) {
-    const account = await this.wallets.getAccount(from);
-    if (this.config.mode === "simulation") {
-      await this.rpc.getPublicClient().estimateGas({
-        account,
-        to: token,
-        data,
-      });
-      return { simulated: true as const };
-    }
-    const walletClient = this.rpc.createWalletClient(account);
-    const nonce = await this.nonces.reserveNonce(from);
-    try {
-      const hash = await walletClient.sendTransaction({
-        account,
-        to: token,
-        data,
-        chain: this.rpc.chain,
-        nonce,
-      });
-      await this.nonces.markNonceSubmitted(from, nonce);
-      return { hash, simulated: false as const };
-    } catch (err) {
-      await this.nonces.releaseNonce(from, nonce);
-      throw err;
-    }
+    return sendDirectTransaction(this.config, this.rpc, this.nonces, from, () => this.wallets.getAccount(from), { to: token, data });
   }
 }

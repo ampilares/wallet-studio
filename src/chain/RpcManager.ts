@@ -18,6 +18,7 @@ import {
   type NetworkName,
 } from "./networks.js";
 import type { AppConfig } from "../config.js";
+import { safeRpcError } from "../security/errors.js";
 
 export type RpcEndpoint = {
   name: string;
@@ -136,7 +137,7 @@ export class RpcManager {
           name: endpoint.name,
           ok: false,
           latencyMs: Date.now() - started,
-          error: err instanceof Error ? err.message : String(err),
+          error: safeRpcError(err),
         });
       }
     }

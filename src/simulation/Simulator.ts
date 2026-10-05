@@ -5,7 +5,8 @@ import type { GasManager } from "../chain/GasManager.js";
 import type { WalletManager } from "../wallet/WalletManager.js";
 import type { Bundle, BundleAction } from "../types.js";
 import type { BundleRepository } from "../database/repositories.js";
-import { assertBundleChain, hasSubmissionEvidence, isMockAction } from "../core/transactionSafety.js";
+import { assertBundleChain, bundleFingerprint, hasSubmissionEvidence, isMockAction } from "../core/transactionSafety.js";
+import { safeRpcError } from "../security/errors.js";
 
 export type SimulationIssue = {
   actionId: string;
@@ -34,7 +35,6 @@ export class Simulator {
     assertBundleChain(bundle, this.config);
     const issues: SimulationIssue[] = [];
     const minGas = parseEther(String(this.config.minGasEth));
-    const client = this.rpc.getPublicClient();
 
     for (const wallet of bundle.wallets) {
       const bal = await this.wallets.getBalance(wallet);
@@ -70,12 +70,12 @@ export class Simulator {
         }
       }
       bundle.status = "SIMULATED";
+      if (this.config.mode === "live" && !bundle.actions.some(isMockAction)) {
+        bundle.dryRun = { chainId: bundle.chainId!, fingerprint: bundleFingerprint(bundle), verifiedAt: new Date().toISOString() };
+      }
       bundle.updatedAt = new Date().toISOString();
       await this.repo.save(bundle);
     }
-
-    // silence unused in edge path
-    void client;
 
     return {
       ok,
@@ -122,7 +122,7 @@ export class Simulator {
         value: BigInt(action.valueWei ?? "0"),
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = safeRpcError(err);
       // In simulation mode without live DEX, soft-warn instead of hard-fail for SWAP
       if (this.config.mode === "simulation" && action.type === "SWAP") {
         issues.push({

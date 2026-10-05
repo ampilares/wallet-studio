@@ -10,6 +10,9 @@ import { once } from "node:events";
 import { request as httpRequest } from "node:http";
 import { StudioService } from "./service.js";
 import { createStudioServer } from "./server.js";
+import { JsonStore } from "../database/JsonStore.js";
+import type { MintCampaign } from "../nft/types.js";
+import type { Activity } from "./types.js";
 
 const passphrase = "studio QA fixture - no real funds";
 async function freePort() {
@@ -55,6 +58,11 @@ test("vault encryption, locking, persistence and localhost API boundaries", asyn
       req.on("error", reject); req.end();
     });
     assert.equal(badHostStatus, 403);
+    const malformedStatus = await new Promise<number | undefined>((resolve, reject) => {
+      const req = httpRequest(origin, { path: "http://[", headers: { Host: new URL(origin).host } }, res => { res.resume(); resolve(res.statusCode); });
+      req.on("error", reject); req.end();
+    });
+    assert.equal(malformedStatus, 400);
     assert.equal((await request("setup", { passphrase }, { "X-Studio-Request": "" })).status, 403);
     assert.equal((await request("setup", { passphrase, extra: true })).status, 400);
     assert.equal((await request("setup", { passphrase })).status, 200);
@@ -86,7 +94,35 @@ test("vault encryption, locking, persistence and localhost API boundaries", asyn
 });
 
 const anvilPath = path.join(homedir(), ".foundry", "bin", process.platform === "win32" ? "anvil.exe" : "anvil");
-test("real local EVM: fund ten wallets, review, send, distribute, collect and prevent repeats", { skip: !existsSync(anvilPath) && "Foundry Anvil is required for local EVM integration", timeout: 90_000 }, async () => {
+test("Sepolia setup cannot bypass the shared vault unlock attempt limit", async () => {
+  const temp = await temporary();
+  const port = await freePort();
+  let attempts = 0;
+  const service = new StudioService(temp.dir);
+  const { server, launchUrl } = createStudioServer(service, "missing-assets", port, undefined, undefined, async () => {
+    attempts++; throw new Error("incorrect passphrase");
+  });
+  server.listen(port, "127.0.0.1"); await once(server, "listening");
+  const origin = new URL(launchUrl).origin;
+  let cookie = "";
+  const request = (route: string, body: unknown) => fetch(`${origin}/api/${route}`, { method: "POST", headers: {
+    Origin: origin, "Content-Type": "application/json", "X-Studio-Request": "1", Cookie: cookie,
+  }, body: JSON.stringify(body) });
+  try {
+    const response = await request("session", { token: new URL(launchUrl).hash.slice(7) });
+    cookie = response.headers.get("set-cookie")!.split(";")[0];
+    await response.arrayBuffer();
+    for (let i = 0; i < 5; i++) { const result = await request("sepolia/setup", { passphrase: "incorrect" }); assert.equal(result.status, 400); await result.arrayBuffer(); }
+    for (const route of ["sepolia/setup", "unlock"]) { const result = await request(route, { passphrase }); assert.equal(result.status, 429); await result.arrayBuffer(); }
+    assert.equal(attempts, 5);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    await temp.cleanup();
+  }
+});
+
+test("real local EVM: fund ten wallets, review, send, distribute, collect and prevent repeats", { skip: !existsSync(anvilPath) && "Foundry Anvil is required for local EVM integration", timeout: 90_000 }, async t => {
   const temp = await temporary();
   const port = await freePort();
   const rpc = `http://127.0.0.1:${port}`;
@@ -131,6 +167,46 @@ test("real local EVM: fund ten wallets, review, send, distribute, collect and pr
     service.lock();
     await service.unlock(passphrase);
     await assert.rejects(service.execute(lockedPlan.id), /expired/);
+
+    const history = new JsonStore<Activity[]>(path.join(temp.dir, "activity.json"), []);
+    await t.test("a reviewed transfer is blocked if an NFT submission appears before execution", async () => {
+      const review = await service.preview(input);
+      const campaigns = new JsonStore<MintCampaign[]>(path.join(temp.dir, "nft-campaigns.json"), []);
+      await campaigns.write([{ id: "pending-mint", updatedAt: "", input: { network: "local" }, jobs: [{ wallet: addresses[0], status: "signed", txHash: `0x${"11".repeat(32)}`, attempts: [] }] }] as unknown as MintCampaign[]);
+      await assert.rejects(service.execute(review.id), /unresolved NFT/);
+      await campaigns.write([]);
+    });
+    await t.test("execution rechecks transfers recorded after preview", async () => {
+      const review = await service.preview(input);
+      const rows = await history.read();
+      await history.write([...rows, { id: "ambiguous", network: "local", kind: "transfer", from: addresses[0], to: addresses[1], amount: "1", status: "signed", createdAt: "" }]);
+      await assert.rejects(service.execute(review.id), /unresolved ETH transfer/);
+      await history.write(rows);
+    });
+    await t.test("mixed-case wallet selection cannot duplicate payments", async () => {
+      const review = await service.preview({ ...input, kind: "distribute", wallets: [addresses[1], addresses[1].toLowerCase()] });
+      assert.equal(review.lines.length, 1);
+    });
+    await t.test("old pending transactions reconcile outside the 80-row display window", async () => {
+      const rows = await history.read();
+      const original = rows.find(row => row.kind === "transfer" && row.hash)!;
+      await history.write([{ ...original, id: "old-pending", status: "submitted" }, ...Array.from({ length: 81 }, (_, i) => ({ ...original, id: `display-${i}`, status: "confirmed" as const }))]);
+      assert.equal((await service.state("local")).activity.length, 80);
+      assert.equal((await history.read())[0].status, "confirmed");
+      await history.write(rows);
+    });
+    await t.test("lock during nonce lookup revokes a reviewed transfer before signing", async () => {
+      const review = await service.preview(input);
+      const connection = await service.chainConnection("local");
+      const lookup = connection.client.getTransactionCount.bind(connection.client);
+      t.mock.method(connection.client, "getTransactionCount", async (args: Parameters<typeof lookup>[0]) => { const nonce = await lookup(args); service.lock(); return nonce; });
+      const override = t.mock.method(service as unknown as { checkedConnection: StudioService["chainConnection"] }, "checkedConnection", async () => connection);
+      const count = (await history.read()).length;
+      try { await assert.rejects(service.execute(review.id), /Unlock/); }
+      finally { override.mock.restore(); }
+      assert.equal((await history.read()).length, count, "no signed record or broadcast");
+      await service.unlock(passphrase);
+    });
   } finally {
     node.kill();
     await exited;

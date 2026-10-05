@@ -1,8 +1,18 @@
 # Wallet Studio
 
+## Canonical repository and NFT extension
+
+Use this GitHub checkout as the project root: `D:/Shared/GitHub/wallet-studio`, with origin `https://github.com/ampilares/wallet-studio.git`. The OneDrive workspace used during planning was a duplicate; its useful changes have been reconciled here. See [reconciliation notes](RECONCILIATION.md).
+
+The initial [NFT extension](PLAN.md) uses the existing Studio vault, with a dedicated [BTC Genesis Miners mainnet setup guide](GENESIS_MINT.md). It is not a complete implementation of every item in the broader plan. The dashboard creates ten wallets initially and can add wallets up to 200 total; the add-wallet dialog accepts the remaining capacity in one operation. Mainnet supports reviewed **Distribute ETH** batches and NFT campaigns, each with explicit approval plus `MAINNET_SEND_ENABLED=true`; unrestricted Send/Collect ETH remains disabled.
+
+Run `npm run studio` here. The launcher prints the vault directory and retains `data/studio` as its default, preserving existing wallets. Set `STUDIO_DATA_DIR` to an explicit private location only if you intend to use another vault directory; no existing data is relocated. The standalone launcher reads this override from the environment or `.env`. CLI `DATA_DIR` and BTC69K integration profiles remain separate.
+
 Multi-wallet transaction orchestration for Base mainnet and Base Sepolia (OP Stack, EVM, ETH gas). Uses viem's Base chain definitions and transaction serializers.
 
 Default mode is **simulation** (no broadcasts). Switch to `live` only when you intend to send real transactions.
+
+The [23 September codebase audit and remediation report](CODEBASE_AUDIT.md) records current security, recovery, stale-code and verification findings.
 
 ## BTC69K integration
 
@@ -61,13 +71,25 @@ Open the localhost link printed in the terminal. Create a vault with your own pa
 
 The launcher starts [Foundry Anvil](https://getfoundry.sh/anvil/overview/) if installed under `~/.foundry/bin` or on your PATH. Anvil runs on `127.0.0.1:18545`, chain ID 31337, with no pre-unlocked accounts. Its test ETH has no monetary value. The dashboard runs on `127.0.0.1:4310`; keep the terminal running and use Ctrl+C to stop it. Restart with `npm run studio` and open the newly printed link. If Anvil is missing, the dashboard still opens and reports the unavailable local network.
 
-Use the network selector for **Base Sepolia** (84532), where wallets need actual Base Sepolia test ETH, or **Base mainnet** (8453), which is **read-only in this testing UI**. The same addresses work on each network; balances and activity are separate. Studio sends real signed transactions to the selected test chain and is independent of the CLI's simulation setting.
+Use the network selector for **Base Sepolia** (84532), where wallets need actual Base Sepolia test ETH, or **Base mainnet** (8453). Mainnet **Distribute ETH** funds the other vault wallets from one managed sender using a reviewed, persistent batch. With 200 wallets this sends 199 separate transactions, not one atomic transaction. See [funding instructions](GENESIS_MINT.md#fund-all-wallets-from-one-studio-wallet). Mainnet Send/Collect ETH remains disabled. The same addresses work on each network; balances and activity are separate. Dashboard broadcasts are independent of the CLI's simulation setting.
 
-The encrypted vault lives at `data/studio/vault.json`, independently of existing CLI wallets and `.env` settings. Anvil state is saved at `data/studio/anvil-state.json` every five seconds. The passphrase remains in server memory while unlocked and is cleared after 15 minutes without a protected action or when you lock the vault. Private keys are never returned to the browser. Vault settings lets you download an encrypted backup; retain its passphrase separately. To restore a backup, stop Studio, preserve the current vault file, copy the backup to `data/studio/vault.json`, and restart. The passphrase cannot be recovered if lost.
+### NFT mint campaigns
 
-The server accepts loopback requests only, checks Host and Origin, and requires its launch token plus an HttpOnly session cookie. It provides no arbitrary RPC proxy, raw-key export, token approvals, or contract-call endpoint. Local software running as your user can still access your files and local node; this is a local testing tool.
+For **BTC Genesis Miners**, use **Base mainnet → NFT campaigns → Use BTC Genesis preset** and follow [GENESIS_MINT.md](GENESIS_MINT.md). Do not enter a generic `mint` function for this collection: the transaction must go to its SeaDrop router. `npm run nft:genesis:fork-test` rehearses this exact collection on a disposable local Base fork without sending mainnet transactions.
 
-Validation: `npm test` includes the vault/API security tests and a real ten-wallet Anvil integration test when Anvil is installed at `~/.foundry/bin`; that integration test is explicitly skipped otherwise. `npm run typecheck` checks both server and React UI.
+Open **NFT campaigns** in the Studio sidebar. Create a draft using the collection's reviewed human-readable mint function signature, its exact function name and supported argument mapping. Select wallets on the Wallets page first to limit the campaign; otherwise the draft includes the whole vault, up to 200 wallets. Enter prices and ceilings in ETH. The service stores all amounts as integer wei. The Genesis preset still mints exactly one NFT per wallet, subject to on-chain availability.
+
+Preflight verifies the selected chain, deployed bytecode, encoded arguments, contract simulation, wallet balances, gas estimate plus Base L1/operator fees and a contingency buffer, per-wallet fee ceiling, and aggregate spend ceiling. Reviews expire after five minutes. A configuration change creates a new revision before any transaction is signed; campaigns with signed history cannot be revised. Per-wallet allowlist values are supported by the API's `wallet-specific` argument mapping; the generic dashboard exposes common recipient/quantity adapters.
+
+Execution permits at most ten concurrent wallet jobs (two for Genesis). It persists the nonce, deterministic transaction hash, encrypted signed bytes, receipt identity, actual fee, and decoded token IDs. Pause stops new dispatch; Stop New Submissions cannot undo broadcasts. A shared cross-process vault-operation lock prevents concurrent transfer/mint workers. After a restart, reconcile recorded transactions before resuming. Listing never changes another process's running state. Recovery only rebroadcasts identical signed bytes; a signed job is never reset by preflight or retry. Hard crashes can leave a lock requiring operator inspection; see the Genesis guide.
+
+For production providers, set `STUDIO_BASE_SEPOLIA_RPC_URL` or `STUDIO_BASE_MAINNET_RPC_URL`; optional `_SECONDARY` values provide read failover. Each endpoint is checked against the expected chain ID. Mainnet minting additionally requires the campaign approval checkbox and `MAINNET_SEND_ENABLED=true`; unset it immediately after the approved broadcast session. Always rehearse a controlled collection on Base Sepolia before mainnet.
+
+The encrypted vault lives at `data/studio/vault.json`, independently of existing CLI wallets; `STUDIO_DATA_DIR` in the environment or `.env` can override the directory. Anvil state is saved at `data/studio/anvil-state.json` every five seconds. The passphrase remains in server memory while unlocked and is cleared after 15 minutes without a protected action or when you lock the vault. Private keys are never returned to the browser. Vault settings lets you download an encrypted backup; retain its passphrase separately. To restore a backup, stop Studio, preserve the current vault file, copy the backup to `data/studio/vault.json`, and restart. The passphrase cannot be recovered if lost.
+
+The server accepts loopback requests only, checks Host and Origin, and requires its launch token plus an HttpOnly session cookie. It provides no arbitrary RPC proxy or raw-key export. NFT calls are encoded server-side only from the reviewed campaign adapter. Local software running as your user can still access your files and local node; this is a local operations tool.
+
+Validation: `npm test` discovers test sources and runs them with a clean environment and disposable working directory, without loading the operational `.env` or opening saved vaults. It includes vault/API security tests and local Anvil transfer/funding tests when Anvil is installed at `~/.foundry/bin`; those integration tests are explicitly skipped otherwise. `npm run typecheck` checks both server and React UI.
 
 ## Network
 
@@ -165,6 +187,9 @@ npm run dev -- bundle reconcile <bundleId>
 
 # Tx history
 npm run dev -- tx list --bundle <bundleId>
+
+# Reconcile direct wallet/token sends after a timeout (never resends)
+npm run dev -- wallet reconcile
 ```
 
 ## Live DEX + sequencer
@@ -182,13 +207,19 @@ The **mock** adapter is available only in simulation mode. Live buys require a c
 
 Every live bundle transaction is signed locally. Its computed hash and nonce are stored before broadcasting. `retry-failed`, `resume`, and `reconcile` retain this identity: a timeout or missing receipt never automatically causes another send. Actions with prior submission evidence, including confirmed reverts, require explicit investigation before creating replacement actions. Older ambiguous records without a hash also remain blocked. Cloning resets execution state and represents a new spending instruction; do not clone pending transactions as a recovery shortcut.
 
+Direct CLI wallet funding, consolidation and token calls also require the mainnet gate in live mainnet mode. They share the bundle execution lock, record hash/nonce before broadcast in `direct-transactions.json`, and wait for a receipt. A timeout blocks further sends from that wallet until `wallet reconcile` resolves the recorded hash. This command only reads receipts; repeating a completed command is a new spending instruction. Bundle execution also blocks unresolved work from other bundles or direct sends in the same data directory.
+
+Bundle edits and deletes that would erase signed transaction history are rejected, including stale edits made while another process was signing. Reload and reconcile the existing bundle before changing unsigned work.
+
+Legacy bundle funding now sends each wallet's shortfall against the plan's target, excludes the sender and includes a separate transfer fee reserve in the balance check. CLI dashboard fee totals show **L2 execution fees** from recorded receipt prices, with unavailable historical prices marked `not recorded`; they do not include Base L1/operator fees. NFT and mainnet Studio funding retain their fuller Base fee accounting.
+
 Direct sequencer submission is optional and is not an atomic bundle service or an ordering guarantee. Sequencer endpoints are excluded from read-RPC failover and are only health-checked when `USE_SEQUENCER=true`. Start with the standard RPC path. Use a verified Uniswap V2-compatible router on the selected chain; V3/Universal Router addresses do not implement this adapter's ABI.
 
 Gas estimates currently cover L2 execution only. Keep an additional ETH reserve for Base's L1 data and operator fees; the funding estimate is not a complete transaction-fee quote.
 
 ## Token deploy note
 
-`TokenManager.deployToken` contains placeholder bytecode and supports simulation only. Live deployment is explicitly disabled. Enabling it requires a reviewed compiled artifact and a corresponding implementation change; replacing the bytecode alone does not enable broadcasting.
+`TokenManager.deployToken` validates and encodes constructor arguments in simulation, returning `constructorData` and `deploymentSupported: false`. It does not return executable bytecode. The old placeholder artifact has been removed; live deployment remains disabled until a reviewed compiled artifact and deployment workflow are implemented.
 
 ## Data
 
@@ -225,7 +256,7 @@ npx tsx examples/basic-bundle.ts
 ## Programmatic use
 
 ```ts
-import { Bundler } from "base-token-bundler";
+import { Bundler } from "./dist/index.js"; // from a script in this repository
 
 const bundler = Bundler.create({ mode: "simulation", network: "sepolia" });
 const wallet = await bundler.wallets.createWallet("bot-1");

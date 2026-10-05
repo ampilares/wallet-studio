@@ -1,6 +1,24 @@
 import path from "node:path";
 import type { Bundle, ManagedWallet, RecordedTransaction } from "../types.js";
 import { JsonStore } from "./JsonStore.js";
+import { hasSubmissionEvidence } from "../core/transactionSafety.js";
+
+/** Check under the store lock so a stale editor cannot erase a concurrent send. */
+function retainSubmissionHistory(previous: Bundle, next: Bundle): void {
+  for (const old of previous.actions.filter(hasSubmissionEvidence)) {
+    const action = next.actions.find(item => item.id === old.id);
+    if (!action || previous.chainId !== next.chainId ||
+        (old.txHash !== undefined && old.txHash !== action.txHash) ||
+        (old.nonce !== undefined && old.nonce !== action.nonce) ||
+        old.walletAddress.toLowerCase() !== action.walletAddress.toLowerCase() ||
+        old.target?.toLowerCase() !== action.target?.toLowerCase() ||
+        (old.valueWei ?? "0") !== (action.valueWei ?? "0") || old.calldata !== action.calldata ||
+        (["CONFIRMED", "REVERTED"].includes(old.status) && old.status !== action.status) ||
+        (["CREATED", "VALIDATED", "SIMULATED", "CANCELLED"].includes(action.status) && old.status !== action.status)) {
+      throw new Error("Cannot erase or rewrite signed transaction history. Reload and reconcile the existing bundle.");
+    }
+  }
+}
 
 export class WalletRepository {
   private store: JsonStore<ManagedWallet[]>;
@@ -68,6 +86,7 @@ export class BundleRepository {
     await this.store.update((all) => {
       const idx = all.findIndex((b) => b.id === bundle.id);
       if (idx >= 0) {
+        retainSubmissionHistory(all[idx], bundle);
         const next = [...all];
         next[idx] = bundle;
         return next;
@@ -81,6 +100,7 @@ export class BundleRepository {
     await this.store.update((all) => {
       const next = all.filter((b) => {
         const keep = b.id !== id;
+        if (!keep && b.actions.some(hasSubmissionEvidence)) throw new Error("Cannot delete a bundle with signed transaction history.");
         if (!keep) removed = true;
         return keep;
       });

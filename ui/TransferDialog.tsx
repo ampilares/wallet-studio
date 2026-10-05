@@ -3,11 +3,16 @@ import { ArrowRight, ArrowUpRight, CheckCircle, ShieldCheck } from "@phosphor-ic
 import type { StudioState, TransferInput, TransferPreview } from "../src/studio/types.js";
 import { api } from "./api.js";
 import { Field, FormError, Modal, short } from "./components.js";
+import { MainnetFundingDialog } from "./MainnetFundingDialog.js";
 
-export function TransferDialog({ state, kind, selected, focused, onClose, onDone }: {
+type Props = {
   state: StudioState; kind: TransferInput["kind"]; selected: string[]; focused: string;
   onClose: () => void; onDone: (message: string) => void;
-}) {
+};
+export function TransferDialog(props: Props) {
+  return props.state.network.key === "mainnet" && props.kind === "distribute" ? <MainnetFundingDialog {...props} /> : <TestTransferDialog {...props} />;
+}
+function TestTransferDialog({ state, kind, selected, focused, onClose, onDone }: Props) {
   const [from, setFrom] = useState(focused || state.wallets[0]?.address || "");
   const [to, setTo] = useState(state.wallets.find(w => w.address !== focused)?.address || "");
   const [external, setExternal] = useState(false);

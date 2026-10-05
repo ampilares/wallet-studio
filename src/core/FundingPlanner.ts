@@ -5,6 +5,7 @@ import type { Bundle, FundingPlan } from "../types.js";
 import type { WalletManager } from "../wallet/WalletManager.js";
 import type { GasManager } from "../chain/GasManager.js";
 import type { BundleRepository } from "../database/repositories.js";
+import { safeCliError } from "../security/errors.js";
 
 export type FundingPlanReport = {
   plan: FundingPlan;
@@ -12,6 +13,9 @@ export type FundingPlanReport = {
   alreadyFunded: Address[];
   totalRequiredWei: string;
   totalRequiredEth: string;
+  shortfalls: { wallet: Address; amountWei: string }[];
+  feeReserveWei: string;
+  totalWithFeeReserveWei: string;
   funderBalanceWei?: string;
   funderBalanceEth?: string;
   funderHasEnough?: boolean;
@@ -57,27 +61,43 @@ export class FundingPlanner {
     const target = BigInt(plan.perWalletWei);
     const needing: Address[] = [];
     const funded: Address[] = [];
+    const shortfalls: FundingPlanReport["shortfalls"] = [];
+    const seen = new Set<string>();
 
     for (const wallet of bundle.wallets) {
+      const key = wallet.toLowerCase();
+      if (seen.has(key) || key === plan.funderAddress?.toLowerCase()) continue;
+      seen.add(key);
       const bal = await this.wallets.getBalance(wallet);
       if (bal >= target) funded.push(wallet);
-      else needing.push(wallet);
+      else { needing.push(wallet); shortfalls.push({ wallet, amountWei: (target - bal).toString() }); }
     }
 
-    const totalRequired = target * BigInt(needing.length);
+    const totalRequired = shortfalls.reduce((sum, line) => sum + BigInt(line.amountWei), 0n);
+    let feeReserve = 0n;
+    if (plan.funderAddress && shortfalls.length) {
+      const fees = await this.gas.getGasPrice();
+      for (const line of shortfalls) {
+        const gas = await this.gas.estimateWalletGas(line.wallet, "0x", BigInt(line.amountWei), plan.funderAddress);
+        feeReserve += this.gas.applyBuffer(gas, bundle.gasPlan) * fees.maxFeePerGas;
+      }
+      // An additional batch reserve, not a protocol-level cap on Base L1 fees.
+      feeReserve += BigInt(plan.minGasWei);
+    }
     const report: FundingPlanReport = {
       plan,
       walletsNeedingFunds: needing,
       alreadyFunded: funded,
       totalRequiredWei: totalRequired.toString(),
       totalRequiredEth: formatEther(totalRequired),
+      shortfalls, feeReserveWei: feeReserve.toString(), totalWithFeeReserveWei: (totalRequired + feeReserve).toString(),
     };
 
     if (plan.funderAddress) {
       const funderBal = await this.wallets.getBalance(plan.funderAddress);
       report.funderBalanceWei = funderBal.toString();
       report.funderBalanceEth = formatEther(funderBal);
-      report.funderHasEnough = funderBal >= totalRequired;
+      report.funderHasEnough = funderBal >= totalRequired + feeReserve;
     }
 
     return report;
@@ -109,12 +129,21 @@ export class FundingPlanner {
       return { report, results: [] };
     }
 
-    const perEth = formatEther(BigInt(report.plan.perWalletWei));
-    const distributed = await this.gas.distributeGas(
-      report.plan.funderAddress,
-      report.walletsNeedingFunds,
-      perEth,
-    );
-    return { report, results: distributed.results };
+    if (!report.funderHasEnough) throw new Error("Funder needs enough ETH for shortfalls and the transfer fee reserve");
+    const results: { to: Address; ok: boolean; error?: string; hash?: string }[] = [];
+    for (const line of report.shortfalls) {
+      try {
+        const current = await this.wallets.getBalance(line.wallet);
+        const amount = BigInt(report.plan.perWalletWei) - current;
+        if (amount <= 0n) continue;
+        if (amount > BigInt(line.amountWei)) throw new Error("Recipient balance changed. Review the funding plan again.");
+        const result = await this.wallets.fundWallet(report.plan.funderAddress, line.wallet, formatEther(amount));
+        results.push({ to: line.wallet, ok: true, hash: result.hash });
+      } catch (error) {
+        results.push({ to: line.wallet, ok: false, error: safeCliError(error) });
+        break; // An ambiguous transfer stops the batch until reconciliation.
+      }
+    }
+    return { report, results };
   }
 }

@@ -69,7 +69,6 @@ export class NonceManager {
       const nonce = Math.max(state.pending, state.confirmed,
         ...state.reserved.map((reserved) => reserved + 1));
       state.reserved.push(nonce);
-      state.pending = Math.max(state.pending, nonce + 1);
       this.states.set(this.key(address), state);
       return nonce;
     });

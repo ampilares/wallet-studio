@@ -13,6 +13,7 @@ import type { ManagedWallet, WalletStatus } from "../types.js";
 import { decryptSecret, encryptSecret } from "./crypto.js";
 import { requireWalletPassphrase } from "./passphrase.js";
 import type { NonceManager } from "./NonceManager.js";
+import { reconcileDirectTransactions, sendDirectTransaction } from "../core/DirectTransactionSender.js";
 
 export class WalletManager {
   constructor(
@@ -81,7 +82,9 @@ export class WalletManager {
       wallet.salt,
       this.config.walletPassphrase,
     ) as Hex;
-    return privateKeyToAccount(pk);
+    const account = privateKeyToAccount(pk);
+    if (account.address.toLowerCase() !== address.toLowerCase()) throw new Error("Wallet identity check failed");
+    return account;
   }
 
   async getBalance(address: Address): Promise<bigint> {
@@ -128,30 +131,9 @@ export class WalletManager {
     to: Address,
     amountEth: string,
   ): Promise<{ hash?: Hex; simulated: boolean }> {
-    const account = await this.getAccount(from);
     const value = parseEther(amountEth);
-    const walletClient = this.rpc.createWalletClient(account);
-    const request = {
-      account,
-      to,
-      value,
-      chain: this.rpc.chain,
-    };
-
-    if (this.config.mode === "simulation") {
-      await this.rpc.getPublicClient().estimateGas(request);
-      return { simulated: true };
-    }
-
-    const nonce = await this.nonces.reserveNonce(from);
-    try {
-      const hash = await walletClient.sendTransaction({ ...request, nonce });
-      await this.nonces.markNonceSubmitted(from, nonce);
-      return { hash, simulated: false };
-    } catch (err) {
-      await this.nonces.releaseNonce(from, nonce);
-      throw err;
-    }
+    if (value <= 0n) throw new Error("Funding amount must be positive");
+    return sendDirectTransaction(this.config, this.rpc, this.nonces, from, () => this.getAccount(from), { to, value });
   }
 
   async consolidateWallet(
@@ -160,35 +142,17 @@ export class WalletManager {
     leaveGasEth?: string,
   ): Promise<{ hash?: Hex; amountWei: string; simulated: boolean }> {
     const leave = parseEther(leaveGasEth ?? String(this.config.minGasEth));
+    if (leave < 0n) throw new Error("Gas reserve cannot be negative");
     const balance = await this.getBalance(from);
     if (balance <= leave) {
       throw new Error(`Insufficient balance to consolidate from ${from}`);
     }
     const amount = balance - leave;
-    const account = await this.getAccount(from);
-    const walletClient = this.rpc.createWalletClient(account);
-    const request = {
-      account,
-      to,
-      value: amount,
-      chain: this.rpc.chain,
-    };
-
-    if (this.config.mode === "simulation") {
-      await this.rpc.getPublicClient().estimateGas(request);
-      return { amountWei: amount.toString(), simulated: true };
-    }
-
-    const nonce = await this.nonces.reserveNonce(from);
-    try {
-      const hash = await walletClient.sendTransaction({ ...request, nonce });
-      await this.nonces.markNonceSubmitted(from, nonce);
-      return { hash, amountWei: amount.toString(), simulated: false };
-    } catch (err) {
-      await this.nonces.releaseNonce(from, nonce);
-      throw err;
-    }
+    const result = await sendDirectTransaction(this.config, this.rpc, this.nonces, from, () => this.getAccount(from), { to, value: amount });
+    return { ...result, amountWei: amount.toString() };
   }
+
+  reconcileTransactions() { return reconcileDirectTransactions(this.config, this.rpc); }
 
   async removeWallet(address: Address): Promise<boolean> {
     return this.repo.remove(address);

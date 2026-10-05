@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { createPublicClient, createWalletClient, http, formatEther, parseEther, getAddress, isAddress, keccak256, type Address, type Hex, type TransactionRequest } from "viem";
+import { createPublicClient, createWalletClient, fallback, http, formatEther, parseEther, getAddress, isAddress, keccak256, type Address, type Hex, type TransactionRequest } from "viem";
 import { anvil, base, baseSepolia } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { JsonStore } from "../database/JsonStore.js";
@@ -9,6 +9,9 @@ import { requireWalletPassphrase } from "../wallet/passphrase.js";
 import { withFileLock } from "../utils/fileLock.js";
 import type { ManagedWallet } from "../types.js";
 import type { Activity, NetworkInfo, StudioNetwork, StudioState, TransferInput, TransferPreview } from "./types.js";
+import { NftCampaignService } from "../nft/CampaignService.js";
+import { FundingService } from "./FundingService.js";
+import { MAX_STUDIO_WALLETS } from "./limits.js";
 
 export class StudioError extends Error {}
 export const NETWORKS: NetworkInfo[] = [
@@ -31,12 +34,16 @@ export class StudioService {
   private lockTimer?: ReturnType<typeof setTimeout>;
   private plans = new Map<string, Plan>();
   private busy = false;
+  readonly nft: NftCampaignService;
+  readonly funding: FundingService;
 
   constructor(readonly dataDir: string, readonly localRpc = "http://127.0.0.1:18545") {
     const url = new URL(localRpc);
     if (url.hostname !== "127.0.0.1" || url.protocol !== "http:") throw new Error("Local RPC must use IPv4 loopback HTTP");
     this.store = new JsonStore(path.join(dataDir, "vault.json"), null);
     this.history = new JsonStore(path.join(dataDir, "activity.json"), []);
+    this.nft = new NftCampaignService(this);
+    this.funding = new FundingService(this);
   }
 
   network(key: StudioNetwork): NetworkInfo {
@@ -49,17 +56,58 @@ export class StudioService {
     this.network(key);
     const chain = key === "local" ? anvil : key === "sepolia" ? baseSepolia : base;
     // The browser never supplies an RPC URL or arbitrary RPC method.
-    const transport = http(key === "local" ? this.localRpc : chain.rpcUrls.default.http[0], { timeout: 8_000, retryCount: 0 });
+    const [primary, secondary] = this.rpcUrls(key);
+    const options = { timeout: 8_000, retryCount: 0 } as const;
+    const transport = secondary ? fallback([http(primary, options), http(secondary, options)], { rank: false }) : http(primary, options);
     return { chain, client: createPublicClient({ chain, transport }), transport };
   }
 
   private async checkedConnection(key: StudioNetwork) {
     const connection = this.connection(key);
     try {
-      if (await connection.client.getChainId() !== connection.chain.id) throw new Error("chain mismatch");
+      for (const url of this.rpcUrls(key)) {
+        if (!url) continue;
+        const client = createPublicClient({ chain: connection.chain, transport: http(url, { timeout: 8_000, retryCount: 0 }) });
+        if (await client.getChainId() !== connection.chain.id) throw new Error("chain mismatch");
+      }
     } catch { throw new StudioError("Cannot connect to the selected network. Check the local node or try refreshing."); }
     return connection;
   }
+
+  private rpcUrls(key: StudioNetwork): [string, string?] {
+    if (key === "local") return [this.localRpc];
+    const chain = key === "sepolia" ? baseSepolia : base;
+    const primary = key === "sepolia" ? process.env.STUDIO_BASE_SEPOLIA_RPC_URL : process.env.STUDIO_BASE_MAINNET_RPC_URL;
+    const secondary = key === "sepolia" ? process.env.STUDIO_BASE_SEPOLIA_RPC_URL_SECONDARY : process.env.STUDIO_BASE_MAINNET_RPC_URL_SECONDARY;
+    return [primary || chain.rpcUrls.default.http[0], secondary || undefined];
+  }
+
+  /** Trusted server-side chain access for feature services. */
+  chainConnection(key: StudioNetwork): ReturnType<StudioService["checkedConnection"]> { return this.checkedConnection(key); }
+
+  /** Shares the vault's cross-process send lock with NFT campaign workers. */
+  exclusiveOperation<T>(work: () => Promise<T>): Promise<T> { return this.exclusive(work); }
+
+  async assertNoPendingTransfers(network: StudioNetwork, wallets: readonly Address[]) {
+    const selected = new Set(wallets.map(wallet => wallet.toLowerCase()));
+    if ((await this.history.read()).some(row => row.network === network && row.kind === "transfer" && row.from && selected.has(row.from.toLowerCase()) && ["signed", "submitted", "unknown"].includes(row.status))) throw new StudioError("A selected wallet has an unresolved ETH transfer. Refresh activity for its receipt first.");
+  }
+
+  private async assertNoPendingSends(network: StudioNetwork, wallets: readonly Address[]) {
+    await this.assertNoPendingTransfers(network, wallets);
+    const selected = new Set(wallets.map(wallet => wallet.toLowerCase()));
+    if ((await this.nft.list(network)).some(campaign => campaign.jobs.some(job =>
+      selected.has(job.wallet.toLowerCase()) && (job.txHash || job.attempts.length) &&
+      ["signed", "submitted", "included", "unresolved"].includes(job.status)))) {
+      throw new StudioError("A selected wallet has an unresolved NFT transaction. Reconcile its campaign before sending ETH.");
+    }
+  }
+
+  /** Encrypt recovery material with the currently unlocked vault session. */
+  sealForSession(value: string) { return encryptSecret(value, this.secret()); }
+
+  /** Decrypt recovery material only while the vault is explicitly unlocked. */
+  openForSession(ciphertext: string, iv: string, salt: string) { return decryptSecret(ciphertext, iv, salt, this.secret()); }
 
   get unlocked(): boolean {
     if (Date.now() > this.unlockedUntil) this.lock();
@@ -121,10 +169,10 @@ export class StudioService {
 
   async addWallets(count: number): Promise<void> {
     const secret = this.secret();
-    if (!Number.isInteger(count) || count < 1 || count > 10) throw new StudioError("Create between 1 and 10 wallets at a time.");
+    if (!Number.isInteger(count) || count < 1 || count > MAX_STUDIO_WALLETS) throw new StudioError(`Create between 1 and ${MAX_STUDIO_WALLETS} wallets at a time, within the vault limit.`);
     await this.exclusive(async () => {
       await this.store.update(vault => {
-        if (!vault || vault.wallets.length + count > 100) throw new StudioError("This vault supports up to 100 wallets.");
+        if (!vault || vault.wallets.length + count > MAX_STUDIO_WALLETS) throw new StudioError(`This vault supports up to ${MAX_STUDIO_WALLETS} wallets.`);
         const start = vault.wallets.length;
         return { ...vault, wallets: [...vault.wallets, ...Array.from({ length: count }, (_, i) => this.newWallet(secret, `Wallet ${String(start + i + 1).padStart(2, "0")}`))] };
       });
@@ -175,10 +223,11 @@ export class StudioService {
         }));
       }
       // Reconcile known hashes without resending an ambiguous transaction.
-      const pending = result.activity.filter(row => row.hash && ["signed", "submitted", "unknown"].includes(row.status));
+      const pending = history.filter(row => row.network === key && row.hash && ["signed", "submitted", "unknown"].includes(row.status));
       for (const row of pending) {
         try {
           const receipt = await client.getTransactionReceipt({ hash: row.hash as Hex });
+          if (receipt.transactionHash !== row.hash) continue;
           row.status = receipt.status === "success" ? "confirmed" : "reverted";
           await this.history.update(rows => rows.map(old => old.id === row.id ? { ...old, status: row.status } : old));
         } catch { /* A missing receipt is not evidence that a send failed. */ }
@@ -226,17 +275,14 @@ export class StudioService {
       amount = parseEther(input.amount);
       if (amount <= 0n) throw new Error();
     } catch { throw new StudioError("Enter an ETH amount greater than zero, with up to 18 decimal places."); }
-    const selected = [...new Set(input.wallets)];
-    if (selected.length > 100) throw new StudioError("Too many wallets selected.");
+    const selected = [...new Set(input.wallets.map(address => managed(address)))];
+    if (selected.length > MAX_STUDIO_WALLETS) throw new StudioError("Too many wallets selected.");
     const pairs = input.kind === "send" ? [{ from: managed(input.from), to: recipient(input.to) }]
       : input.kind === "distribute" ? selected.map(a => ({ from: managed(input.from), to: managed(a) }))
       : selected.map(a => ({ from: managed(a), to: recipient(input.to) }));
     if (!pairs.length) throw new StudioError("Select at least one wallet.");
     if (pairs.some(p => p.from.toLowerCase() === p.to.toLowerCase())) throw new StudioError("The sender and recipient must be different wallets.");
-    const history = await this.history.read();
-    if (history.some(row => row.network === input.network && row.kind === "transfer" && ["signed", "submitted", "unknown"].includes(row.status) && pairs.some(pair => pair.from === row.from))) {
-      throw new StudioError("A selected wallet has an unresolved transaction. Refresh activity for its receipt before sending again.");
-    }
+    await this.assertNoPendingSends(input.network, pairs.map(pair => pair.from));
     const transactions: Prepared[] = [];
     const nonces = new Map<Address, number>();
     const costs = new Map<Address, bigint>();
@@ -263,29 +309,29 @@ export class StudioService {
   }
 
   async execute(id: string): Promise<{ sent: number }> {
-    const secret = this.secret();
+    this.secret();
     return this.exclusive(async () => {
       const plan = this.plans.get(id);
       this.plans.delete(id); // Single-use, including errors or ambiguous broadcasts.
       if (!plan || Date.now() > plan.preview.expiresAt) throw new StudioError("This review expired or was already used. Review a new transfer.");
       const { client, chain } = await this.checkedConnection(plan.preview.network.key);
-      const vault = await this.store.read();
       let sent = 0;
       for (const tx of plan.transactions) {
-        const wallet = vault?.wallets.find(w => w.address === tx.address);
-        if (!wallet) throw new StudioError("Wallet not found.");
-        const account = privateKeyToAccount(decryptSecret(wallet.encryptedPrivateKey, wallet.iv, wallet.salt, secret) as Hex);
-        if (account.address !== tx.address) throw new StudioError("Wallet identity check failed.");
+        await this.assertNoPendingSends(plan.preview.network.key, [tx.address]);
+        const account = await this.getAccount(tx.address);
         if (await client.getTransactionCount({ address: tx.address, blockTag: "pending" }) !== tx.request.nonce) throw new StudioError("Wallet nonce changed. Refresh and review again.");
+        this.secret(); // A lock during an RPC wait revokes further signatures.
         const signed = await account.signTransaction({ ...tx.request, chainId: chain.id } as Parameters<typeof account.signTransaction>[0]);
         const hash = keccak256(signed);
         const record: Activity = { id: randomUUID(), network: plan.preview.network.key, kind: "transfer", from: tx.address, to: tx.request.to!, amount: formatEther(tx.amount), hash, status: "signed", createdAt: new Date().toISOString() };
         await this.history.update(rows => [...rows, record]);
         try {
+          this.secret(); // Preserve the signed identity if the session was locked.
           const returnedHash = await client.sendRawTransaction({ serializedTransaction: signed });
           if (returnedHash !== hash) throw new Error("hash mismatch");
           await this.history.update(rows => rows.map(row => row.id === record.id ? { ...row, status: "submitted" } : row));
           const receipt = await client.waitForTransactionReceipt({ hash, timeout: 20_000 });
+          if (receipt.transactionHash !== hash) throw new Error("Receipt identity mismatch");
           await this.history.update(rows => rows.map(row => row.id === record.id ? { ...row, status: receipt.status === "success" ? "confirmed" : "reverted" } : row));
           if (receipt.status !== "success") throw new StudioError("The transaction reverted. See activity before sending again.");
           sent++;

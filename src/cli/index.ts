@@ -4,6 +4,7 @@ import { normalizeNetwork } from "../chain/networks.js";
 import { formatEther, parseEther, type Address } from "viem";
 import { Bundler } from "../core/Bundler.js";
 import { readPrivateKey, readSecret } from "./secretInput.js";
+import { safeCliError } from "../security/errors.js";
 
 function printJson(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
@@ -30,6 +31,11 @@ async function main() {
     });
   };
 
+  program.hook("preAction", async () => {
+    const bundler = getBundler();
+    await bundler.assertRuntime();
+  });
+
   program
     .command("health")
     .description("Check RPC endpoints and network config")
@@ -39,6 +45,10 @@ async function main() {
     });
 
   const wallet = program.command("wallet").description("Wallet management");
+
+  wallet.command("reconcile")
+    .description("Reconcile direct wallet/token transaction hashes without resending")
+    .action(async () => { printJson(await getBundler().wallets.reconcileTransactions()); });
 
   wallet
     .command("reencrypt")
@@ -445,11 +455,7 @@ async function main() {
           symbol: opts.symbol,
           initialSupply: parseEther(opts.supply),
         });
-        printJson({
-          simulated: result.simulated,
-          address: result.address,
-          hash: result.hash,
-        });
+        printJson(result);
       },
     );
 
@@ -511,6 +517,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err instanceof Error ? err.message : err);
+  console.error(safeCliError(err));
   process.exitCode = 1;
 });

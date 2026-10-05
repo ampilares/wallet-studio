@@ -4,6 +4,10 @@ export { base, baseMainnet, baseSepolia, getChain, normalizeNetwork, type Networ
 export { SequencerClient } from "./chain/SequencerClient.js";
 export { SubmissionMetrics } from "./chain/SubmissionMetrics.js";
 export { FundingPlanner } from "./core/FundingPlanner.js";
+export { GarlicBuyPresets, type NativeBuyPreset, type AdapterBuyPreset } from "./core/GarlicBuyPresets.js";
 export { renderBundleDashboard } from "./utils/dashboard.js";
 export { mapPool, RateLimiter } from "./utils/concurrency.js";
+export { NftCampaignService } from "./nft/CampaignService.js";
+export { encodeMint, decodeMintReceipt, validateCampaignInput } from "./nft/adapter.js";
+export type * from "./nft/types.js";
 export type * from "./types.js";

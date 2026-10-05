@@ -8,6 +8,9 @@ import path from "node:path";
 import { resolveSepoliaProfiles } from "../dist/sepolia/profiles.js";
 import { SepoliaService } from "../dist/sepolia/service.js";
 import { createStudioServer } from "../dist/studio/server.js";
+import { hardenSensitiveFiles } from "./harden-sensitive-files.mjs";
+
+hardenSensitiveFiles(root, process.env.DATA_DIR || "data/base-sepolia");
 
 execFileSync(foundryBinary("forge"),["build","--root",path.join(bitcoinRoot,"contracts"),"--quiet"],{windowsHide:true,stdio:"inherit"});
 const profile=process.env.SEPOLIA_PROFILE || "default";

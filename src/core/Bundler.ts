@@ -1,4 +1,3 @@
-import type { Address } from "viem";
 import { loadConfig, type AppConfig, type ConfigOverrides } from "../config.js";
 import { RpcManager } from "../chain/RpcManager.js";
 import { GasManager } from "../chain/GasManager.js";
@@ -19,6 +18,8 @@ import { ExecutionEngine } from "./ExecutionEngine.js";
 import { FundingPlanner } from "./FundingPlanner.js";
 import { Simulator } from "../simulation/Simulator.js";
 import { renderBundleDashboard } from "../utils/dashboard.js";
+import { hardenSensitiveFiles } from "../security/sensitiveFiles.js";
+import { GarlicBuyPresets } from "./GarlicBuyPresets.js";
 
 export class Bundler {
   readonly config: AppConfig;
@@ -33,12 +34,14 @@ export class Bundler {
   readonly simulator: Simulator;
   readonly events: EventMonitor;
   readonly funding: FundingPlanner;
+  readonly garlic: GarlicBuyPresets;
   readonly sequencer: SequencerClient;
   readonly txRepo: TransactionRepository;
   private readonly bundleRepo: BundleRepository;
 
   private constructor(config: AppConfig) {
     this.config = config;
+    hardenSensitiveFiles(config.dataDir);
     this.rpc = new RpcManager(config);
     this.nonces = new NonceManager(this.rpc);
     this.sequencer = new SequencerClient(
@@ -56,14 +59,15 @@ export class Bundler {
 
     this.dex = new DexManager();
 
-    const router = process.env.DEX_ROUTER_ADDRESS as Address | undefined;
-    const weth = process.env.WETH_ADDRESS as Address | undefined;
+    const router = config.dexRouterAddress;
+    const weth = config.wethAddress;
     if (router && weth) {
       this.dex.register(new UniswapV2Adapter(this.rpc, router, weth));
     }
     if (config.mode === "simulation") this.dex.register(new MockDexAdapter());
 
     this.bundles = new BundleBuilder(config, this.bundleRepo, this.dex, this.tokens);
+    this.garlic = new GarlicBuyPresets(config, this.rpc, this.bundles);
     this.simulator = new Simulator(
       config,
       this.rpc,
@@ -93,6 +97,12 @@ export class Bundler {
 
   static create(overrides: ConfigOverrides = {}): Bundler {
     return new Bundler(loadConfig(overrides));
+  }
+
+  async assertRuntime(): Promise<void> {
+    if (this.config.network !== "mainnet") return;
+    const chainId = await this.rpc.getPublicClient().getChainId();
+    if (chainId !== 8453) throw new Error(`Base mainnet RPC chain mismatch: expected 8453, received ${chainId}`);
   }
 
   async health(): Promise<{

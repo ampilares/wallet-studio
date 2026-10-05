@@ -8,13 +8,19 @@ import { keccak256, type Address, type Hex } from "viem";
 import { JsonStore } from "./database/JsonStore.js";
 import { BundleRepository, TransactionRepository } from "./database/repositories.js";
 import { ExecutionEngine } from "./core/ExecutionEngine.js";
-import { loadConfig } from "./config.js";
+import { BASE_MAINNET_UNISWAP_V2_ROUTER, BASE_MAINNET_WETH, loadConfig } from "./config.js";
 import { encryptSecret, decryptSecret } from "./wallet/crypto.js";
 import { Bundler } from "./core/Bundler.js";
 import { Simulator } from "./simulation/Simulator.js";
-import { MOCK_ROUTER } from "./core/transactionSafety.js";
+import { assertFreshDryRun, assertGarlicSpendCeilings, bundleFingerprint, MOCK_ROUTER } from "./core/transactionSafety.js";
+import { hardenSensitiveFiles } from "./security/sensitiveFiles.js";
+import { execFileSync } from "node:child_process";
+import { chmod, stat } from "node:fs/promises";
+import { GarlicBuyPresets } from "./core/GarlicBuyPresets.js";
 import { NonceManager } from "./wallet/NonceManager.js";
 import type { Bundle } from "./types.js";
+import { safeCliError, safeRpcError } from "./security/errors.js";
+import { BundleBuilder } from "./core/BundleBuilder.js";
 
 const wallet = "0x1111111111111111111111111111111111111111" as Address;
 const token = "0x2222222222222222222222222222222222222222" as Address;
@@ -41,18 +47,21 @@ function sampleBundle(): Bundle {
   };
 }
 
-async function harness(directory: string) {
-  const config = loadConfig({ dataDir: directory, mode: "live", network: "sepolia" });
+async function harness(directory: string, network: "sepolia" | "mainnet" = "sepolia") {
+  const config = loadConfig({ dataDir: directory, mode: "live", network,
+    ...(network === "mainnet" ? { wethAddress: BASE_MAINNET_WETH,
+      dexRouterAddress: BASE_MAINNET_UNISWAP_V2_ROUTER } : {}) });
   const bundles = new BundleRepository(directory);
   const txs = new TransactionRepository(directory);
-  await bundles.save(sampleBundle());
+  await bundles.save({ ...sampleBundle(), chainId: network === "mainnet" ? 8453 : 84532 });
   let sends = 0;
   let nonce = 0;
   let receiptAvailable = false;
   let sendError = false;
   let wrongHash = false;
-  const receipt = { status: "success", gasUsed: 21000n, blockNumber: 10n };
+  const receipt = { transactionHash: expectedHash, status: "success", gasUsed: 21000n, effectiveGasPrice: 1n, blockNumber: 10n };
   const client = {
+    getChainId: async () => network === "mainnet" ? 8453 : 84532,
     estimateGas: async () => 21000n,
     getTransactionReceipt: async () => {
       if (!receiptAvailable) throw new Error("Receipt not found");
@@ -86,7 +95,7 @@ async function harness(directory: string) {
     wallets as never, nonces as never, simulator as never, bundles, txs);
   return { config, bundles, txs, engine, sends: () => sends, nonce: () => nonce,
     confirm: () => { receiptAvailable = true; }, loseResponse: () => { sendError = true; },
-    tamperHash: () => { wrongHash = true; } };
+    tamperHash: () => { wrongHash = true; }, tamperReceipt: () => { receipt.transactionHash = keccak256("0x00"); } };
 }
 
 test("manifest and lockfile have only the reviewed direct dependencies", async () => {
@@ -118,18 +127,155 @@ test("live mode has no mock adapter and uses the real router when configured", (
   try {
     delete process.env.DEX_ROUTER_ADDRESS;
     delete process.env.WETH_ADDRESS;
-    const live = Bundler.create({ mode: "live" });
+    const live = Bundler.create({ mode: "live", network: "sepolia" });
     assert.throws(() => live.dex.default(), /No DEX/);
     assert.throws(() => live.dex.get("mock"), /not found/);
-    process.env.DEX_ROUTER_ADDRESS = token;
-    process.env.WETH_ADDRESS = wallet;
-    const configured = Bundler.create({ mode: "live" });
+    const configured = Bundler.create({ mode: "live", network: "mainnet",
+      dexRouterAddress: BASE_MAINNET_UNISWAP_V2_ROUTER, wethAddress: BASE_MAINNET_WETH });
     assert.equal(configured.dex.default().name, "uniswap-v2");
-    assert.equal(configured.dex.default().wrappedNativeToken, wallet);
+    assert.equal(configured.dex.default().wrappedNativeToken, BASE_MAINNET_WETH);
   } finally {
     if (oldRouter === undefined) delete process.env.DEX_ROUTER_ADDRESS; else process.env.DEX_ROUTER_ADDRESS = oldRouter;
     if (oldWeth === undefined) delete process.env.WETH_ADDRESS; else process.env.WETH_ADDRESS = oldWeth;
   }
+});
+
+test("mainnet configuration accepts only the embedded canonical Base deployments", () => {
+  assert.throws(() => loadConfig({ network: "mainnet", wethAddress: wallet,
+    dexRouterAddress: BASE_MAINNET_UNISWAP_V2_ROUTER }), /WETH_ADDRESS/);
+  assert.throws(() => loadConfig({ network: "mainnet", wethAddress: BASE_MAINNET_WETH,
+    dexRouterAddress: token }), /DEX_ROUTER_ADDRESS/);
+  const config = loadConfig({ network: "mainnet", wethAddress: BASE_MAINNET_WETH,
+    dexRouterAddress: BASE_MAINNET_UNISWAP_V2_ROUTER });
+  assert.equal(config.wethAddress, BASE_MAINNET_WETH);
+  assert.equal(config.dexRouterAddress, BASE_MAINNET_UNISWAP_V2_ROUTER);
+});
+
+test("mainnet dry runs are bound to the exact transaction state", () => {
+  const bundle = { ...sampleBundle(), chainId: 8453 };
+  bundle.dryRun = { chainId: 8453, fingerprint: bundleFingerprint(bundle), verifiedAt: new Date().toISOString() };
+  assert.doesNotThrow(() => assertFreshDryRun(bundle));
+  bundle.actions[0]!.valueWei = "2";
+  assert.throws(() => assertFreshDryRun(bundle), /exact bundle/);
+  bundle.actions[0]!.valueWei = "1";
+  bundle.dryRun = { chainId: 8453, fingerprint: bundleFingerprint(bundle), verifiedAt: new Date().toISOString() };
+  bundle.gasPlan.maxFeePerGas = "2";
+  assert.throws(() => assertFreshDryRun(bundle), /exact bundle/);
+});
+
+test("mainnet executor refuses sends without both explicit flag and prior dry run", async (t) => {
+  const h = await harness(await temporary(t), "mainnet");
+  await assert.rejects(h.engine().executeBundle("bundle"), /Mainnet send is disabled/);
+  assert.equal(h.sends(), 0);
+  assert.equal(h.nonce(), 0);
+  h.config.mainnetSendEnabled = true;
+  await assert.rejects(h.engine().executeBundle("bundle"), /successful dry run/);
+  assert.equal(h.sends(), 0);
+  assert.equal(h.nonce(), 0);
+});
+
+test("Garlic spend ceilings and factory allocation caps fail before signing", () => {
+  const bundle = { ...sampleBundle(), actions: [
+    { ...sampleBundle().actions[0]!, id: "one", type: "CONTRACT_CALL" as const, valueWei: "6",
+      params: { garlicPreset: "buyNative", walletSpendCeilingWei: "10", quotedTokens: "4", factoryRemainingTokens: "10" } },
+    { ...sampleBundle().actions[0]!, id: "two", type: "CONTRACT_CALL" as const, valueWei: "5",
+      params: { garlicPreset: "buyAdapter", walletSpendCeilingWei: "10", quotedTokens: "4", factoryRemainingTokens: "10" } },
+  ] };
+  assert.throws(() => assertGarlicSpendCeilings(bundle), /spend ceiling/);
+  bundle.actions[1]!.valueWei = "4";
+  bundle.actions[1]!.params!.quotedTokens = "11";
+  assert.throws(() => assertGarlicSpendCeilings(bundle), /allocation cap/);
+});
+
+test("sensitive config and stores receive restrictive permissions", async (t) => {
+  const root = await temporary(t);
+  const legacyData = path.join(root, "data");
+  const data = path.join(legacyData, "base-sepolia");
+  await mkdir(data, { recursive: true });
+  const files = [path.join(root, ".env"), ...["wallets.json", "bundles.json", "vault.json", "nft-campaigns.json", "mainnet-funding.json", "direct-transactions.json"].map(file => path.join(data, file)),
+    path.join(legacyData, "wallets.json"), path.join(legacyData, "bundles.json")];
+  for (const file of files) {
+    await writeFile(file, "[]");
+    if (process.platform === "win32") {
+      execFileSync("icacls.exe", [file, "/grant", "*S-1-1-0:F"], { windowsHide: true, stdio: "ignore" });
+      assert.match(execFileSync("icacls.exe", [file], { encoding: "utf8", windowsHide: true }), /Everyone/i);
+    } else await chmod(file, 0o666);
+  }
+  hardenSensitiveFiles(data, root);
+  for (const file of files) {
+    if (process.platform === "win32") {
+      const acl = execFileSync("icacls.exe", [file], { encoding: "utf8", windowsHide: true });
+      assert.doesNotMatch(acl, /Everyone|Authenticated Users|BUILTIN\\Users/i);
+    } else {
+      assert.equal((await stat(file)).mode & 0o777, 0o600);
+    }
+  }
+});
+
+test("Garlic buyNative preset reads chain caps and records bounded calldata", async () => {
+  const factory = "0x3333333333333333333333333333333333333333" as Address;
+  const curve = "0x4444444444444444444444444444444444444444" as Address;
+  let added: Record<string, unknown> | undefined;
+  const readContract = async ({ functionName }: { functionName: string }) => ({
+    factory, quote: BASE_MAINNET_WETH, Smax: 100n, saleAllocation: 80n, sold: 20n,
+    tradePaused: false, isCurve: true, quoteBuy: [30n, 10n, 1n],
+  } as Record<string, unknown>)[functionName];
+  const builder = {
+    get: async () => ({ ...sampleBundle(), actions: [] }),
+    addAction: async (_id: string, input: Record<string, unknown>) => { added = input; return sampleBundle(); },
+  };
+  const config = loadConfig({ network: "sepolia", garlicFactoryAddress: factory });
+  const presets = new GarlicBuyPresets(config,
+    { chain: { id: 84532 }, getPublicClient: () => ({ readContract }) } as never, builder as never);
+  await presets.addBuyNative({ bundleId: "bundle", wallet, curve, spendWei: 10n,
+    walletSpendCeilingWei: 12n, minTokens: 25n, deadline: Math.floor(Date.now() / 1000) + 600 });
+  assert.equal(added?.type, "CONTRACT_CALL");
+  assert.equal(added?.valueWei, "10");
+  assert.equal((added?.params as Record<string, unknown>).factoryRemainingTokens, "60");
+  await assert.rejects(presets.addBuyNative({ bundleId: "bundle", wallet, curve, spendWei: 13n,
+    walletSpendCeilingWei: 12n, minTokens: 25n, deadline: Math.floor(Date.now() / 1000) + 600 }), /spend ceiling/);
+  const unboundMainnet = new GarlicBuyPresets(loadConfig({ network: "mainnet",
+    wethAddress: BASE_MAINNET_WETH, dexRouterAddress: BASE_MAINNET_UNISWAP_V2_ROUTER }),
+  { chain: { id: 8453 }, getPublicClient: () => ({ readContract }) } as never, builder as never);
+  await assert.rejects(unboundMainnet.addBuyNative({ bundleId: "bundle", wallet, curve, spendWei: 10n,
+    walletSpendCeilingWei: 12n, minTokens: 25n, deadline: Math.floor(Date.now() / 1000) + 600 }), /GARLIC_FACTORY_ADDRESS/);
+});
+
+test("Garlic adapter preset binds self recipients and the on-chain route", async () => {
+  const factory = "0x3333333333333333333333333333333333333333" as Address;
+  const curve = "0x4444444444444444444444444444444444444444" as Address;
+  const adapter = "0x5555555555555555555555555555555555555555" as Address;
+  let added: Record<string, unknown> | undefined;
+  let quote: Address = BASE_MAINNET_WETH;
+  let sold = 20n;
+  let graduated = false;
+  const readContract = async ({ functionName }: { functionName: string }) => ({
+    factory, wrappedNative: BASE_MAINNET_WETH, quote,
+    Smax: 100n, saleAllocation: 80n, sold, tradePaused: false,
+    isCurve: true, enabled: true, graduated,
+  } as Record<string, unknown>)[functionName];
+  const builder = {
+    get: async () => ({ ...sampleBundle(), actions: [] }),
+    addAction: async (_id: string, input: Record<string, unknown>) => { added = input; return sampleBundle(); },
+  };
+  const presets = new GarlicBuyPresets(loadConfig({ network: "sepolia", garlicFactoryAddress: factory,
+    garlicBuyAdapterAddress: adapter }),
+  { chain: { id: 84532 }, getPublicClient: () => ({ readContract }) } as never, builder as never);
+  const deadline = Math.floor(Date.now() / 1000) + 600;
+  await presets.addAdapterBuy({ bundleId: "bundle", wallet, curve, spendWei: 10n,
+    walletSpendCeilingWei: 12n, minQuote: 9n, minTokens: 25n, routeFee: 0, deadline });
+  assert.equal(added?.target, adapter);
+  assert.equal((added?.params as Record<string, unknown>).garlicPreset, "buyAdapter");
+  await assert.rejects(presets.addAdapterBuy({ bundleId: "bundle", wallet, curve, spendWei: 10n,
+    walletSpendCeilingWei: 12n, minQuote: 9n, minTokens: 25n, routeFee: 3000, deadline }), /route fee/);
+  await assert.rejects(presets.addAdapterBuy({ bundleId: "bundle", wallet, curve, spendWei: 10n,
+    walletSpendCeilingWei: 12n, minQuote: 9n, minTokens: 25n, routeFee: 1.5, deadline }), /route fee/);
+  graduated = true;
+  quote = token;
+  sold = 80n;
+  await presets.addAdapterBuy({ bundleId: "bundle", wallet, curve, spendWei: 10n,
+    walletSpendCeilingWei: 12n, minQuote: 9n, minTokens: 25n, routeFee: 3000, deadline, graduated: true });
+  assert.equal((added?.params as Record<string, unknown>).factoryCapApplies, false);
 });
 
 test("persisted mock bundles cannot bypass the live executor guard", async (t) => {
@@ -272,16 +418,16 @@ test("stdin key import validates without echoing the secret", async () => {
   assert.doesNotMatch(invalid.output, /invalid-sensitive-key/);
 });
 
-test("placeholder token deployment is blocked before loading keys or sending", async () => {
-  const bundler = Bundler.create({ mode: "live" });
-  await assert.rejects(bundler.tokens.deployToken({ from: wallet, name: "Token", symbol: "T", initialSupply: 1n }), /placeholder/);
+test("unimplemented token deployment is blocked before loading keys or sending", async () => {
+  const bundler = Bundler.create({ mode: "live", network: "sepolia" });
+  await assert.rejects(bundler.tokens.deployToken({ from: wallet, name: "Token", symbol: "T", initialSupply: 1n }), /no reviewed compiled artifact/);
 });
 
 test("passphrase rotation updates all keys atomically and preserves data on failure", async (t) => {
   const directory = await temporary(t);
   const oldPassphrase = "test-only original passphrase";
   const newPassphrase = "test-only replacement passphrase";
-  const bundler = Bundler.create({ mode: "simulation", dataDir: directory, walletPassphrase: oldPassphrase });
+  const bundler = Bundler.create({ mode: "simulation", network: "sepolia", dataDir: directory, walletPassphrase: oldPassphrase });
   const first = await bundler.wallets.importWallet(`0x${"01".repeat(32)}`);
   const second = await bundler.wallets.importWallet(`0x${"02".repeat(32)}`);
   const original = await readFile(path.join(directory, "wallets.json"), "utf8");
@@ -290,12 +436,12 @@ test("passphrase rotation updates all keys atomically and preserves data on fail
   assert.equal(await bundler.wallets.rotatePassphrase(oldPassphrase, newPassphrase), 2);
   assert.equal((await bundler.wallets.getAccount(first.address)).address, first.address);
   assert.equal((await bundler.wallets.getAccount(second.address)).address, second.address);
-  const old = Bundler.create({ mode: "simulation", dataDir: directory, walletPassphrase: oldPassphrase });
+  const old = Bundler.create({ mode: "simulation", network: "sepolia", dataDir: directory, walletPassphrase: oldPassphrase });
   await assert.rejects(old.wallets.getAccount(first.address));
 });
 
 test("wallet key errors do not disclose the supplied key", async (t) => {
-  const bundler = Bundler.create({ dataDir: await temporary(t), walletPassphrase: "test-only unique passphrase" });
+  const bundler = Bundler.create({ network: "sepolia", dataDir: await temporary(t), walletPassphrase: "test-only unique passphrase" });
   const invalidKey = `0x${"00".repeat(32)}` as Hex;
   await assert.rejects(bundler.wallets.importWallet(invalidKey), (error: Error) => {
     assert.equal(error.message, "Invalid private key");
@@ -326,10 +472,67 @@ test("legacy and wrong-chain bundles cannot execute or reconcile", async (t) => 
   }
 });
 
+test("a new bundle cannot bypass an unresolved transaction in another bundle", async t => {
+  const h = await harness(await temporary(t));
+  const first = await h.engine().executeBundle("bundle");
+  assert.equal(h.sends(), 1);
+  await h.bundles.save({ ...sampleBundle(), id: "another" });
+  await assert.rejects(h.engine().executeBundle("another"), /unresolved transaction in bundle bundle/);
+  assert.equal(h.sends(), 1);
+  assert.equal(first.actions[0].txHash, expectedHash);
+});
+
+test("replacement receipts cannot falsely confirm the originally signed bundle action", async t => {
+  const h = await harness(await temporary(t));
+  h.confirm(); h.tamperReceipt();
+  assert.equal((await h.engine().executeBundle("bundle")).actions[0].status, "SUBMITTED");
+  assert.equal((await h.engine().reconcileBundle("bundle")).actions[0].status, "SUBMITTED");
+  assert.equal(h.sends(), 1);
+});
+
+test("stale bundle edits, removal and deletion cannot erase a concurrent signed transaction", async t => {
+  const h = await harness(await temporary(t));
+  const stale = await h.bundles.get("bundle");
+  await h.engine().executeBundle("bundle");
+  await assert.rejects(h.bundles.save(stale!), /signed transaction history/);
+  const current = (await h.bundles.get("bundle"))!;
+  await assert.rejects(h.bundles.save({ ...current, actions: [] }), /signed transaction history/);
+  await assert.rejects(h.bundles.delete("bundle"), /signed transaction history/);
+  assert.equal((await h.bundles.get("bundle"))!.actions[0].txHash, expectedHash);
+  h.confirm();
+  await h.engine().reconcileBundle("bundle");
+  await assert.rejects(h.bundles.save(current), /signed transaction history/);
+});
+
+test("RPC diagnostics and CLI failures exclude provider URLs and raw payloads", () => {
+  const payload = `0x${"ab".repeat(300)}`;
+  const error = new Error(`RPC https://provider.invalid/v2/PRIVATE_API_KEY request ${payload} timed out`);
+  for (const message of [safeRpcError(error), safeCliError(error)]) {
+    assert.doesNotMatch(message, /PRIVATE_API_KEY|provider.invalid/);
+    assert.ok(!message.includes(payload));
+  }
+  assert.match(safeRpcError(error), /timed out/);
+});
+
+test("bundle fee summary multiplies gas units by price and marks legacy costs unknown", async t => {
+  const repo = new BundleRepository(await temporary(t));
+  const config = loadConfig({ network: "sepolia" });
+  const builder = new BundleBuilder(config, repo, {} as never, {} as never);
+  const bundle = sampleBundle();
+  bundle.actions[0].gasUsed = "21000";
+  bundle.actions[0].effectiveGasPrice = "1000000000";
+  await repo.save(bundle);
+  assert.equal((await builder.summarize(bundle.id)).gasSpentWei, "21000000000000");
+  delete bundle.actions[0].effectiveGasPrice;
+  await repo.save(bundle);
+  assert.equal((await builder.summarize(bundle.id)).gasSpentWei, null);
+});
+
 test("new Base bundles retain chain identity across cloning and block cross-chain operations", async (t) => {
   const directory = await temporary(t);
   const sepolia = Bundler.create({ network: "sepolia", mode: "simulation", dataDir: directory });
-  const mainnet = Bundler.create({ network: "mainnet", mode: "simulation", dataDir: directory });
+  const mainnet = Bundler.create({ network: "mainnet", mode: "simulation", dataDir: directory,
+    dexRouterAddress: BASE_MAINNET_UNISWAP_V2_ROUTER, wethAddress: BASE_MAINNET_WETH });
   const original = await sepolia.bundles.createBundle("Base Sepolia");
   assert.equal(original.chainId, 84532);
   assert.equal((await sepolia.bundles.cloneBundle(original.id)).chainId, 84532);

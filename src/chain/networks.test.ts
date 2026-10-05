@@ -1,10 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { loadConfig } from "../config.js";
+import { BASE_MAINNET_UNISWAP_V2_ROUTER, BASE_MAINNET_WETH, loadConfig, type ConfigOverrides } from "../config.js";
 import { Bundler } from "../core/Bundler.js";
 import { getChain, normalizeNetwork, alchemyHttpUrl, alchemyWsUrl, sequencerUrl } from "./networks.js";
 import { RpcManager } from "./RpcManager.js";
 import { SequencerClient } from "./SequencerClient.js";
+
+const mainnetConfig = (overrides: ConfigOverrides = {}) => loadConfig({
+  network: "mainnet", wethAddress: BASE_MAINNET_WETH,
+  dexRouterAddress: BASE_MAINNET_UNISWAP_V2_ROUTER, ...overrides,
+});
 
 test("Base aliases resolve to the intended chain and provider endpoints", () => {
   for (const network of ["mainnet", "base", "base-mainnet"] as const) {
@@ -33,11 +38,11 @@ test("default data directories follow the effective network and preserve explici
     assert.equal(loadConfig().network, "sepolia");
     assert.equal(loadConfig().dataDir, "./data/base-sepolia");
     process.env.BUNDLER_NETWORK = "mainnet";
-    assert.equal(loadConfig().dataDir, "./data/base-mainnet");
+    assert.equal(mainnetConfig().dataDir, "./data/base-mainnet");
     assert.equal(loadConfig({ network: "testnet" }).dataDir, "./data/base-sepolia");
     process.env.DATA_DIR = "./custom-store";
     assert.equal(loadConfig({ network: "sepolia" }).dataDir, "./custom-store");
-    assert.equal(loadConfig({ dataDir: "./override" }).dataDir, "./override");
+    assert.equal(mainnetConfig({ dataDir: "./override" }).dataDir, "./override");
     assert.throws(() => loadConfig({ network: "typo" as "mainnet" }), /Unsupported/);
   } finally {
     if (oldNetwork === undefined) delete process.env.BUNDLER_NETWORK; else process.env.BUNDLER_NETWORK = oldNetwork;
@@ -47,7 +52,7 @@ test("default data directories follow the effective network and preserve explici
 
 test("RPC fallback contains only read endpoints and WS stays opt-in", () => {
   for (const network of ["mainnet", "sepolia"] as const) {
-    const config = loadConfig({ network, rpcUrl: "", rpcUrlSecondary: "", alchemyApiKey: "", wsUrl: "" });
+    const config = network === "mainnet" ? mainnetConfig({ rpcUrl: "", rpcUrlSecondary: "", alchemyApiKey: "", wsUrl: "" }) : loadConfig({ network, rpcUrl: "", rpcUrlSecondary: "", alchemyApiKey: "", wsUrl: "" });
     const rpc = new RpcManager(config);
     assert.deepEqual(rpc.getHttpUrls(), [getChain(network).rpcUrls.default.http[0]]);
     assert.equal(rpc.getWsTransport(), null);
@@ -63,7 +68,7 @@ test("health rejects a responsive RPC on the wrong chain", async (t) => {
     assert.equal(body.method, "eth_chainId");
     return Response.json({ jsonrpc: "2.0", id: body.id, result: "0x1" });
   });
-  const rpc = new RpcManager(loadConfig({ network: "mainnet", rpcUrl: "", rpcUrlSecondary: "", alchemyApiKey: "" }));
+  const rpc = new RpcManager(mainnetConfig({ rpcUrl: "", rpcUrlSecondary: "", alchemyApiKey: "" }));
   const health = await rpc.healthCheck();
   assert.equal(health.length, 1);
   assert.equal(health[0]!.ok, false);

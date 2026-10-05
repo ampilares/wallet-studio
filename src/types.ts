@@ -40,6 +40,7 @@ export interface BundleAction {
   txHash?: Hash;
   nonce?: number;
   gasUsed?: string;
+  effectiveGasPrice?: string;
   error?: string;
   blockNumber?: string;
   submittedAt?: string;
@@ -76,6 +77,11 @@ export interface Bundle {
   createdAt: string;
   updatedAt: string;
   mode: ExecutionMode;
+  dryRun?: {
+    chainId: number;
+    fingerprint: string;
+    verifiedAt: string;
+  };
 }
 
 export interface ManagedWallet {
@@ -123,7 +129,8 @@ export interface BundleSummary {
   successful: number;
   failed: number;
   pending: number;
-  gasSpentWei: string;
+  /** L2 execution fee only; null when legacy/simulation receipts lack fee data. */
+  gasSpentWei: string | null;
   status: Bundle["status"];
 }
 

@@ -123,7 +123,7 @@ export class CurveService {
           try {
             const receipt = await this.client.getTransactionReceipt({ hash: action.txHash });
             action.status = receipt.status === "success" ? "CONFIRMED" : "REVERTED";
-            action.blockNumber = String(receipt.blockNumber); action.gasUsed = String(receipt.gasUsed); changed = true;
+            action.blockNumber = String(receipt.blockNumber); action.gasUsed = String(receipt.gasUsed); action.effectiveGasPrice = receipt.effectiveGasPrice.toString(); changed = true;
           } catch { /* Keep unresolved identity until an actual receipt is available. */ }
         }
         if (changed) {
@@ -269,7 +269,7 @@ export class CurveService {
     if(plan.route){
       const route=plan.route;
       const actions=plan.input.wallets.map((wallet,i)=>({type:"CONTRACT_CALL" as const,walletAddress:wallet as Address,target:spender,valueWei:route.payment===zeroAddress?plan.amounts[i].toString():"0",calldata:encodeFunctionData({abi:purchaseAbi,functionName:"buy",args:[route.payment,plan.amounts[i],route.path,route.minQuote,plan.minimums[i],route.deadline,route.graduated]})}));
-      const result=await this.bundle(`Routed buy · ${plan.input.payment} · ${actions.length} wallets`,actions,true);
+      const result=await this.bundle(`Routed buy Â· ${plan.input.payment} Â· ${actions.length} wallets`,actions,true);
       this.phase=`${result.actions.filter(a=>a.status==="CONFIRMED").length}/${actions.length} routed trades confirmed. See receipts.`;
       return result;
     }
